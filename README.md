@@ -49,6 +49,8 @@ If the current session has no saved prompts, opening the picker shows an informa
 
 The delete and delete-all keys are configurable. The picker displays its active delete hints.
 
+In [Tern](https://docs.stencil.so/tern/), the picker is drawn as Tern's native picker sheet (search field, rows, and Restore/Delete/Delete all/Close buttons) instead of terminal rows; `popupWidth` and `listRows` apply only to the terminal-row picker. Keys work the same in both.
+
 ## Settings
 
 Settings are stored under the package key `omp-prompt-stash`. Put global settings in:

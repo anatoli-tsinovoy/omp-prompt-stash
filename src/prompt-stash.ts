@@ -17,7 +17,17 @@ import {
   extractPrintableText,
   matchesKey as matchesTuiKey,
 } from "@oh-my-pi/pi-tui";
-import type { KeyId, TUI } from "@oh-my-pi/pi-tui";
+import type {
+  DescribeContext,
+  KeyId,
+  NativeNode,
+  NativeUiEvent,
+  TUI,
+} from "@oh-my-pi/pi-tui";
+
+type PickerNode = Extract<NativeNode, { k: "picker" }>;
+type PickerProps = NonNullable<PickerNode["p"]>;
+type PickerAction = NonNullable<PickerProps["actions"]>[number];
 
 const PACKAGE_ID = "omp-prompt-stash";
 const DEFAULT_STORE_FILE = "prompt-stash.json";
@@ -535,6 +545,108 @@ function renderSearchLine(query: string, width: number, theme: Theme): string {
   return theme.bg("toolPendingBg", padAnsi(content, width));
 }
 
+/** Keycap names for a shortcut id (`"ctrl+r"` → `["ctrl", "r"]`, `"escape"` → `["esc"]`). */
+function pickerKeys(shortcut: string): string[] {
+  const normalized = shortcut.toLowerCase() === "del" ? "delete" : shortcut;
+  return normalized
+    .split("+")
+    .filter((part) => part.length > 0)
+    .map((part) => (part === "escape" ? "esc" : part));
+}
+
+function pickerAction(
+  id: string,
+  label: string,
+  shortcuts: readonly string[],
+  extra: Omit<PickerAction, "id" | "label" | "keys"> = {},
+): PickerAction {
+  const first = shortcuts[0];
+  return first
+    ? { id, label, keys: pickerKeys(first), ...extra }
+    : { id, label, ...extra };
+}
+
+/** Case-insensitive occurrences of `query` in `label` as UTF-16 [from, to) ranges. */
+function queryHits(label: string, query: string): [number, number][] {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return [];
+  const haystack = label.toLowerCase();
+  const hits: [number, number][] = [];
+  for (
+    let at = haystack.indexOf(needle);
+    at !== -1;
+    at = haystack.indexOf(needle, at + needle.length)
+  )
+    hits.push([at, at + needle.length]);
+  return hits;
+}
+
+/**
+ * The stash as Tern's native `picker` sheet: Tern draws the frame, search
+ * field, rows and action bar; keys stay this extension's.
+ */
+function stashPicker(
+  items: readonly StashItem[],
+  results: readonly StashItem[],
+  selectedId: string | null,
+  query: string,
+  confirmDeleteAll: boolean,
+  settings: PromptStashSettings,
+): PickerNode {
+  const rows = results.map((item) => {
+    const label = previewText(item.text);
+    const count = lineCount(item.text);
+    const hits = queryHits(label, query);
+    return {
+      id: item.id,
+      label,
+      facts: { lines: `~${count} ${count === 1 ? "line" : "lines"}` },
+      ...(hits.length > 0 ? { hits } : {}),
+      title: item.createdAt,
+    };
+  });
+  const actions: PickerAction[] = [
+    pickerAction("restore", "Restore", ["enter"], { primary: true }),
+  ];
+  if (settings.deleteShortcuts.length > 0)
+    actions.push(pickerAction("delete", "Delete", settings.deleteShortcuts));
+  if (settings.deleteAllShortcuts.length > 0)
+    actions.push(
+      pickerAction("deleteAll", "Delete all", settings.deleteAllShortcuts, {
+        danger: true,
+      }),
+    );
+  actions.push(pickerAction("close", "Close", ["escape"], { end: true }));
+  return {
+    k: "picker",
+    p: {
+      title: "Prompt Stash",
+      noun: "prompts",
+      size: "md",
+      layout: "rows",
+      preview: "none",
+      query,
+      placeholder: "Search stashed prompts…",
+      columns: [{ id: "lines", format: "dim" }],
+      items: rows,
+      selected: selectedId,
+      total: items.length,
+      empty:
+        items.length === 0
+          ? "Prompt stash is empty"
+          : "No matching stashed prompts",
+      actions,
+      confirm: confirmDeleteAll
+        ? {
+            text: "Delete all stashed prompts?",
+            act: "deleteAll",
+            label: "Delete all",
+          }
+        : null,
+    },
+  };
+}
+
 async function openStashPopup(ctx: ExtensionContext): Promise<void> {
   if (!ctx.hasUI) return;
 
@@ -703,6 +815,84 @@ async function openStashPopup(ctx: ExtensionContext): Promise<void> {
         );
       };
 
+      let nativeMemo:
+        | {
+            items: readonly StashItem[];
+            query: string;
+            selectedId: string | null;
+            confirmDeleteAll: boolean;
+            node: PickerNode;
+          }
+        | undefined;
+
+      const describe = (cx: DescribeContext): NativeNode | null => {
+        if (!cx.supports("picker")) return null;
+        clampSelection();
+        const results = filtered();
+        const selectedId = results[selected]?.id ?? null;
+        if (
+          nativeMemo &&
+          nativeMemo.items === items &&
+          nativeMemo.query === query &&
+          nativeMemo.selectedId === selectedId &&
+          nativeMemo.confirmDeleteAll === confirmDeleteAll
+        )
+          return nativeMemo.node;
+        const node = stashPicker(
+          items,
+          results,
+          selectedId,
+          query,
+          confirmDeleteAll,
+          settings,
+        );
+        nativeMemo = { items, query, selectedId, confirmDeleteAll, node };
+        return node;
+      };
+
+      const selectById = (id: string): boolean => {
+        const index = filtered().findIndex((item) => item.id === id);
+        if (index < 0) return false;
+        selected = index;
+        clampSelection();
+        return true;
+      };
+
+      const handleNativeEvent = (event: NativeUiEvent): void => {
+        if (event.key.replaceAll("^", "") !== "") return;
+        if (event.type === "select") {
+          selectById(event.item);
+          return;
+        }
+        if (event.type === "activate") {
+          if (selectById(event.item)) restoreSelected();
+          return;
+        }
+        if (event.type !== "action") return;
+        switch (event.act) {
+          case "restore":
+            restoreSelected();
+            return;
+          case "delete":
+            deleteSelected();
+            return;
+          case "deleteAll":
+            if (confirmDeleteAll) clearAll();
+            else confirmDeleteAll = items.length > 0;
+            return;
+          case "cancel":
+            if (confirmDeleteAll) {
+              confirmDeleteAll = false;
+              return;
+            }
+            done(null);
+            return;
+          case "close":
+            done(null);
+            return;
+        }
+      };
+
       return {
         get focused(): boolean {
           return focused;
@@ -796,8 +986,13 @@ async function openStashPopup(ctx: ExtensionContext): Promise<void> {
             tui.requestRender();
           }
         },
-        invalidate() {},
+        invalidate() {
+          nativeMemo = undefined;
+        },
         render,
+        nativeSheet: (cx: DescribeContext) => cx.supports("picker"),
+        describe,
+        handleNativeEvent,
       };
     },
     { overlay: true },
