@@ -4,7 +4,7 @@
 
 ## Requirements
 
-- [Oh My Pi](https://github.com/can1357/oh-my-pi) 17.2.9 or later
+- [Oh My Pi](https://github.com/can1357/oh-my-pi) 19.2.1 or later
 
 ## Install
 
@@ -49,7 +49,7 @@ If the current session has no saved prompts, opening the picker shows an informa
 
 The delete and delete-all keys are configurable. The picker displays its active delete hints.
 
-In [Tern](https://docs.stencil.so/tern/), the picker is drawn as Tern's native picker sheet (search field, rows, and Restore/Delete/Delete all/Close buttons) instead of terminal rows; `popupWidth` and `listRows` apply only to the terminal-row picker. Keys work the same in both.
+In Tern, the picker is rendered as Tern's native picker sheet; terminal mode uses pi-tui's picker. `listRows` controls terminal paging and scrolling. `popupWidth` now selects the medium (default) or large picker size rather than an exact cell width.
 
 ## Settings
 
@@ -97,7 +97,7 @@ For a project-only override, create or update `.omp/plugin-overrides.json` in th
 | `deleteAllShortcuts` | string, `"ctrl+x"`            | Comma-separated picker shortcuts that request deletion of all items. Set to `"none"` to disable.                                                                        |
 | `storeFile`          | string, `"prompt-stash.json"` | File name used inside the session's prompt-stash directory. Path components are ignored, so this cannot place data outside that directory.                              |
 | `deduplicate`        | boolean, `true`               | When saving a prompt, removes older saved entries with the same text.                                                                                                   |
-| `popupWidth`         | number, `92` (minimum `40`)   | Preferred visual width of the centered picker panel.                                                                                                                    |
+| `popupWidth`         | number, `92` (minimum `40`)   | Preferred picker width. Values above `92` use the large size; `92` and below use the medium size because pi-tui does not expose exact cell-width control.               |
 | `listRows`           | number, `10` (minimum `1`)    | Number of visible saved-prompt rows before the picker scrolls.                                                                                                          |
 
 Shortcut names are case-insensitive and must use OMP key identifiers. Comma-separated shortcut lists ignore empty entries and `none` entries; `none` by itself disables the list. Empty or wrong-typed settings fall back to their defaults, and numeric values are rounded down to their stated minimums.

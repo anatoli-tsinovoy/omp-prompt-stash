@@ -7,27 +7,22 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import type {
-  ExtensionAPI,
-  ExtensionContext,
-  Theme,
-} from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { getAgentDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
-import {
-  extractPrintableText,
-  matchesKey as matchesTuiKey,
-} from "@oh-my-pi/pi-tui";
+import { computed, jsx, signal } from "@oh-my-pi/pi-tui";
 import type {
-  DescribeContext,
-  KeyId,
-  NativeNode,
-  NativeUiEvent,
-  TUI,
+  KeyEvent,
+  NodeAttributes,
+  PasteEvent,
+  Reactive,
+  UiProps,
 } from "@oh-my-pi/pi-tui";
 
-type PickerNode = Extract<NativeNode, { k: "picker" }>;
-type PickerProps = NonNullable<PickerNode["p"]>;
+type PickerProps = UiProps<"picker">;
 type PickerAction = NonNullable<PickerProps["actions"]>[number];
+type PickerAttributes = {
+  [K in keyof PickerProps]?: Reactive<PickerProps[K]>;
+} & NodeAttributes;
 
 const PACKAGE_ID = "omp-prompt-stash";
 const DEFAULT_STORE_FILE = "prompt-stash.json";
@@ -37,10 +32,6 @@ const DEFAULT_DELETE_SHORTCUTS = "ctrl+r,delete";
 const DEFAULT_DELETE_ALL_SHORTCUTS = "ctrl+x";
 const DEFAULT_POPUP_WIDTH = 92;
 const DEFAULT_LIST_ROWS = 10;
-const PADDING_X = 2;
-const PADDING_Y = 1;
-const FRAME = { tl: "┏", tr: "┓", bl: "┗", br: "┛", h: "━", v: "┃" } as const;
-const ELLIPSIS = "…";
 
 interface StashItem {
   id: string;
@@ -137,13 +128,83 @@ function settingNumber(
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+const KEY_ID_MODIFIERS = ["ctrl", "alt", "shift", "super"] as const;
+const KEY_ID_ALIASES: Record<string, string> = {
+  del: "delete",
+  esc: "escape",
+  return: "enter",
+  pageup: "pageUp",
+  pagedown: "pageDown",
+};
+const SHIFTED_SYMBOLS: Record<string, true> = {
+  "!": true,
+  "@": true,
+  "#": true,
+  $: true,
+  "%": true,
+  "^": true,
+  "&": true,
+  "*": true,
+  "(": true,
+  ")": true,
+  _: true,
+  "+": true,
+  "|": true,
+  "~": true,
+  "{": true,
+  "}": true,
+  ":": true,
+  "<": true,
+  ">": true,
+  "?": true,
+};
+
+function normalizeKeyId(key: string): string {
+  const modifiers = new Set<string>();
+  let offset = 0;
+
+  for (;;) {
+    let found = false;
+    for (const modifier of KEY_ID_MODIFIERS) {
+      const end = offset + modifier.length;
+      if (
+        key.length <= end + 1 ||
+        key[end] !== "+" ||
+        key.slice(offset, end).toLowerCase() !== modifier
+      )
+        continue;
+      modifiers.add(modifier);
+      offset = end + 1;
+      found = true;
+      break;
+    }
+    if (!found) break;
+  }
+
+  const raw = key.slice(offset);
+  const lower = raw.toLowerCase();
+  const base = KEY_ID_ALIASES[lower] ?? lower;
+  if (/^[A-Z]$/.test(raw)) modifiers.add("shift");
+  if (
+    modifiers.size === 1 &&
+    modifiers.has("shift") &&
+    SHIFTED_SYMBOLS[base] === true
+  )
+    return base;
+
+  return `${KEY_ID_MODIFIERS.filter((modifier) => modifiers.has(modifier))
+    .map((modifier) => `${modifier}+`)
+    .join("")}${base}`;
+}
+
 function shortcutList(value: string): string[] {
   const trimmed = value.trim().toLowerCase();
   if (!trimmed || trimmed === "none") return [];
   return trimmed
     .split(",")
     .map((shortcut) => shortcut.trim())
-    .filter((shortcut) => shortcut.length > 0 && shortcut !== "none");
+    .filter((shortcut) => shortcut.length > 0 && shortcut !== "none")
+    .map(normalizeKeyId);
 }
 
 function sanitizeStoreFile(value: string): string {
@@ -335,71 +396,6 @@ function stashPrompt(
   return items.length;
 }
 
-function stripAnsi(text: string): string {
-  return text
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
-    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
-    .replace(/\x1b_pi:[^\x07]*\x07/g, "");
-}
-
-function takeEscapeSequence(text: string, index: number): string | undefined {
-  if (text.charCodeAt(index) !== 0x1b) return undefined;
-  const next = text[index + 1];
-  if (next === "[") {
-    let end = index + 2;
-    while (end < text.length && !/[@-~]/.test(text[end])) end += 1;
-    return text.slice(index, Math.min(text.length, end + 1));
-  }
-  if (next === "]") {
-    const bel = text.indexOf("\x07", index + 2);
-    const st = text.indexOf("\x1b\\", index + 2);
-    const end = bel === -1 ? st : st === -1 ? bel : Math.min(bel, st);
-    return end === -1
-      ? text.slice(index)
-      : text.slice(index, end + (end === st ? 2 : 1));
-  }
-  return text.slice(index, Math.min(text.length, index + 2));
-}
-
-function visibleWidth(text: string): number {
-  return Array.from(stripAnsi(text)).length;
-}
-
-function truncateToWidth(
-  text: string,
-  width: number,
-  ellipsis = ELLIPSIS,
-): string {
-  if (width <= 0) return "";
-  if (visibleWidth(text) <= width) return text;
-  const suffixWidth = visibleWidth(ellipsis);
-  const budget = Math.max(0, width - suffixWidth);
-  let out = "";
-  let used = 0;
-  for (let i = 0; i < text.length;) {
-    if (text.charCodeAt(i) === 0x1b) {
-      const sequence = takeEscapeSequence(text, i);
-      if (sequence) {
-        out += sequence;
-        i += sequence.length;
-        continue;
-      }
-    }
-    const char = Array.from(text.slice(i))[0];
-    if (!char) break;
-    if (used + 1 > budget) break;
-    out += char;
-    used += 1;
-    i += char.length;
-  }
-  return `${out}${ellipsis}`;
-}
-
-function padAnsi(text: string, width: number): string {
-  const truncated = truncateToWidth(text, width, "");
-  return `${truncated}${" ".repeat(Math.max(0, width - visibleWidth(truncated)))}`;
-}
-
 function lineCount(text: string): number {
   return Math.max(1, text.split(/\r\n|\r|\n/).length);
 }
@@ -416,142 +412,34 @@ function searchable(text: string): string {
   return text.toLowerCase();
 }
 
-function panelLine(content: string, width: number): string {
-  return padAnsi(content, width);
-}
-
-function selectedLine(theme: Theme, content: string, width: number): string {
-  return theme.bg("selectedBg", padAnsi(theme.fg("text", content), width));
-}
-
-function popupContentWidth(width: number): number {
-  return Math.max(1, width - 2 - PADDING_X * 2);
-}
-
-function framePopup(
-  lines: string[],
-  width: number,
-  theme: Theme,
-  title = "",
-  right = "",
-): string[] {
-  if (width < 8) return lines.map((line) => truncateToWidth(line, width, ""));
-
-  const border = (text: string) => theme.fg("borderAccent", text);
-  const contentWidth = popupContentWidth(width);
-  const blank = `${border(FRAME.v)}${" ".repeat(width - 2)}${border(FRAME.v)}`;
-  const top = () => {
-    if (!title)
-      return `${border(FRAME.tl)}${border(FRAME.h.repeat(width - 2))}${border(FRAME.tr)}`;
-    const rightPlain = right ? ` ${right} ` : "";
-    const titleBudget = Math.max(1, width - 2 - visibleWidth(rightPlain) - 1);
-    const titlePlain = ` ${truncateToWidth(title, Math.max(1, titleBudget - 2), ELLIPSIS)} `;
-    const fill = Math.max(
-      1,
-      width - 2 - visibleWidth(titlePlain) - visibleWidth(rightPlain),
-    );
-    return `${border(FRAME.tl)}${theme.bold(titlePlain)}${border(FRAME.h.repeat(fill))}${right ? theme.fg("dim", rightPlain) : ""}${border(FRAME.tr)}`;
-  };
-  const framed = [top()];
-
-  for (let i = 0; i < PADDING_Y; i += 1) framed.push(blank);
-  for (const line of lines) {
-    framed.push(
-      `${border(FRAME.v)}${" ".repeat(PADDING_X)}${padAnsi(line, contentWidth)}${" ".repeat(PADDING_X)}${border(FRAME.v)}`,
-    );
-  }
-  for (let i = 0; i < PADDING_Y; i += 1) framed.push(blank);
-  framed.push(
-    `${border(FRAME.bl)}${border(FRAME.h.repeat(width - 2))}${border(FRAME.br)}`,
-  );
-  return framed.map((line) => truncateToWidth(line, width, ""));
-}
-
 function filterItems(items: StashItem[], query: string): StashItem[] {
   const trimmed = query.trim().toLowerCase();
   if (!trimmed) return items;
   return items.filter((item) => searchable(item.text).includes(trimmed));
 }
 
-function matchesKey(data: string, key: string): boolean {
-  const normalized = key.toLowerCase();
-  const keyId =
-    normalized === "del"
-      ? "delete"
-      : normalized === "pageup"
-        ? "pageUp"
-        : normalized === "pagedown"
-          ? "pageDown"
-          : normalized;
-  return matchesTuiKey(data, keyId as KeyId);
+function matchesKey(event: KeyEvent, key: string): boolean {
+  return (
+    event.kind !== "release" && normalizeKeyId(event.id) === normalizeKeyId(key)
+  );
 }
 
 function matchesAnyShortcut(
-  data: string,
+  event: KeyEvent,
   shortcuts: readonly string[],
 ): boolean {
-  return shortcuts.some((shortcut) => matchesKey(data, shortcut));
-}
-
-function shortcutLabel(shortcut: string): string {
-  switch (shortcut.toLowerCase()) {
-    case "delete":
-    case "del":
-      return "Del";
-    default:
-      return shortcut;
-  }
-}
-
-function shortcutHint(shortcuts: readonly string[]): string | undefined {
-  return shortcuts.length > 0
-    ? shortcuts.map(shortcutLabel).join("/")
-    : undefined;
-}
-
-function handleSuspend(tui: TUI): void {
-  if (process.platform === "win32") return;
-  const onResume = (): void => {
-    tui.start();
-    tui.requestRender(true);
-  };
-  process.once("SIGCONT", onResume);
-  tui.stop();
-  try {
-    process.kill(0, "SIGTSTP");
-  } catch {
-    process.removeListener("SIGCONT", onResume);
-    tui.start();
-    tui.requestRender(true);
-  }
-}
-
-interface PopupKeybindings {
-  matches?(data: string, action: "app.display.reset" | "app.suspend"): boolean;
-}
-
-function matchesAction(
-  keybindings: PopupKeybindings,
-  data: string,
-  action: "app.display.reset" | "app.suspend",
-  fallback: string,
-): boolean {
-  return keybindings.matches?.(data, action) ?? matchesKey(data, fallback);
-}
-
-function renderSearchLine(query: string, width: number, theme: Theme): string {
-  const prefix = "> ";
-  const content = truncateToWidth(`${prefix}${query}`, width, "");
-  return theme.bg("toolPendingBg", padAnsi(content, width));
+  return (
+    event.kind !== "release" && shortcuts.includes(normalizeKeyId(event.id))
+  );
 }
 
 /** Keycap names for a shortcut id (`"ctrl+r"` → `["ctrl", "r"]`, `"escape"` → `["esc"]`). */
 function pickerKeys(shortcut: string): string[] {
-  const normalized = shortcut.toLowerCase() === "del" ? "delete" : shortcut;
-  return normalized
-    .split("+")
-    .filter((part) => part.length > 0)
-    .map((part) => (part === "escape" ? "esc" : part));
+  const normalized = normalizeKeyId(shortcut);
+  if (normalized === "+") return ["+"];
+  const parts = normalized.split("+").filter((part) => part.length > 0);
+  if (normalized.endsWith("++")) parts.push("+");
+  return parts.map((part) => (part === "escape" ? "esc" : part));
 }
 
 function pickerAction(
@@ -581,19 +469,12 @@ function queryHits(label: string, query: string): [number, number][] {
   return hits;
 }
 
-/**
- * The stash as Tern's native `picker` sheet: Tern draws the frame, search
- * field, rows and action bar; keys stay this extension's.
- */
-function stashPicker(
-  items: readonly StashItem[],
+/** Build picker rows with prompt previews and line-count facts. */
+function pickerItems(
   results: readonly StashItem[],
-  selectedId: string | null,
   query: string,
-  confirmDeleteAll: boolean,
-  settings: PromptStashSettings,
-): PickerNode {
-  const rows = results.map((item) => {
+): NonNullable<PickerProps["items"]> {
+  return results.map((item) => {
     const label = previewText(item.text);
     const count = lineCount(item.text);
     const hits = queryHits(label, query);
@@ -605,46 +486,6 @@ function stashPicker(
       title: item.createdAt,
     };
   });
-  const actions: PickerAction[] = [
-    pickerAction("restore", "Restore", ["enter"], { primary: true }),
-  ];
-  if (settings.deleteShortcuts.length > 0)
-    actions.push(pickerAction("delete", "Delete", settings.deleteShortcuts));
-  if (settings.deleteAllShortcuts.length > 0)
-    actions.push(
-      pickerAction("deleteAll", "Delete all", settings.deleteAllShortcuts, {
-        danger: true,
-      }),
-    );
-  actions.push(pickerAction("close", "Close", ["escape"], { end: true }));
-  return {
-    k: "picker",
-    p: {
-      title: "Prompt Stash",
-      noun: "prompts",
-      size: "md",
-      layout: "rows",
-      preview: "none",
-      query,
-      placeholder: "Search stashed prompts…",
-      columns: [{ id: "lines", format: "dim" }],
-      items: rows,
-      selected: selectedId,
-      total: items.length,
-      empty:
-        items.length === 0
-          ? "Prompt stash is empty"
-          : "No matching stashed prompts",
-      actions,
-      confirm: confirmDeleteAll
-        ? {
-            text: "Delete all stashed prompts?",
-            act: "deleteAll",
-            label: "Delete all",
-          }
-        : null,
-    },
-  };
 }
 
 async function openStashPopup(ctx: ExtensionContext): Promise<void> {
@@ -653,223 +494,146 @@ async function openStashPopup(ctx: ExtensionContext): Promise<void> {
   const settings = settingsFor(ctx.cwd);
   const path = storePath(ctx, settings);
   mergeLegacyStores(ctx, path, settings);
-  let items = loadItems(path);
-  if (items.length === 0) {
+  const initialItems = loadItems(path);
+  if (initialItems.length === 0) {
     ctx.ui.notify("Prompt stash is empty", "info");
     return;
   }
 
   const restored = await ctx.ui.custom<string | null>(
-    (tui, theme, keybindings, done) => {
-      let query = "";
-      let selected = 0;
-      let scroll = 0;
-      let focused = true;
-      let confirmDeleteAll = false;
-
-      const filtered = () => filterItems(items, query);
-      const clampSelection = () => {
-        const count = filtered().length;
-        if (count === 0) {
-          selected = 0;
-          scroll = 0;
-          return;
-        }
-        selected = Math.max(0, Math.min(selected, count - 1));
-        if (selected < scroll) scroll = selected;
-        if (selected >= scroll + settings.listRows)
-          scroll = selected - settings.listRows + 1;
-        scroll = Math.max(
-          0,
-          Math.min(scroll, Math.max(0, count - settings.listRows)),
+    (_ui, _theme, _keybindings, done) => {
+      const items = signal(initialItems);
+      const query = signal("");
+      const selected = signal(0);
+      const confirmDeleteAll = signal(false);
+      const results = computed(() => filterItems(items(), query()));
+      const rows = computed(() => pickerItems(results(), query()));
+      const selectedId = computed(() => results()[selected()]?.id ?? null);
+      const actions: PickerAction[] = [
+        pickerAction("restore", "Restore", ["enter"], { primary: true }),
+      ];
+      if (settings.deleteShortcuts.length > 0)
+        actions.push(
+          pickerAction("delete", "Delete", settings.deleteShortcuts),
         );
+      if (settings.deleteAllShortcuts.length > 0)
+        actions.push(
+          pickerAction("deleteAll", "Delete all", settings.deleteAllShortcuts, {
+            danger: true,
+          }),
+        );
+      actions.push(pickerAction("close", "Close", ["escape"], { end: true }));
+
+      const clampSelection = (): void => {
+        const last = Math.max(0, results().length - 1);
+        selected.set(Math.max(0, Math.min(selected(), last)));
       };
 
-      const deleteSelected = () => {
-        const item = filtered()[selected];
+      const moveSelection = (delta: number): void => {
+        const last = Math.max(0, results().length - 1);
+        selected.set(Math.max(0, Math.min(selected() + delta, last)));
+      };
+
+      const deleteSelected = (): void => {
+        const item = results()[selected()];
         if (!item) return;
-        items = items.filter((candidate) => candidate.id !== item.id);
-        saveItems(path, items);
+        const next = items().filter((candidate) => candidate.id !== item.id);
+        items.set(next);
+        saveItems(path, next);
         clampSelection();
-        tui.requestRender();
       };
 
-      const clearAll = () => {
-        items = [];
-        saveItems(path, items);
-        confirmDeleteAll = false;
+      const clearAll = (): void => {
+        items.set([]);
+        saveItems(path, []);
+        confirmDeleteAll.set(false);
         clampSelection();
-        tui.requestRender();
       };
 
-      const restoreSelected = () => {
-        const item = filtered()[selected];
-        if (!item) return;
-        done(item.text);
-      };
-
-      const render = (width: number): string[] => {
-        const panelWidth = Math.min(
-          width,
-          Math.max(40, Math.floor(settings.popupWidth)),
-        );
-        const innerWidth = popupContentWidth(panelWidth);
-        const results = filtered();
-        clampSelection();
-
-        const lines: string[] = [];
-        lines.push(
-          panelLine(renderSearchLine(query, innerWidth, theme), innerWidth),
-        );
-        lines.push(panelLine("", innerWidth));
-
-        if (results.length === 0) {
-          lines.push(
-            panelLine(
-              theme.fg("dim", "No matching stashed prompts"),
-              innerWidth,
-            ),
-          );
-        } else {
-          for (const [visibleIndex, item] of results
-            .slice(scroll, scroll + settings.listRows)
-            .entries()) {
-            const index = scroll + visibleIndex;
-            const count = lineCount(item.text);
-            const countText = `~${count} ${count === 1 ? "line" : "lines"}`;
-            const countWidth = visibleWidth(countText);
-            const rowWidth = innerWidth;
-            const itemPad = " ";
-            const previewWidth = Math.max(
-              1,
-              rowWidth - visibleWidth(itemPad) - countWidth - 1,
-            );
-            const preview = truncateToWidth(
-              previewText(item.text),
-              previewWidth,
-              "",
-            );
-            const styledPreview =
-              index === selected ? theme.bold(preview) : preview;
-            const styledCount =
-              index === selected
-                ? theme.fg("text", countText)
-                : theme.fg("dim", countText);
-            const gap = " ".repeat(
-              Math.max(
-                1,
-                rowWidth -
-                  visibleWidth(itemPad) -
-                  visibleWidth(preview) -
-                  countWidth,
-              ),
-            );
-            const row = `${itemPad}${styledPreview}${gap}${styledCount}`;
-            lines.push(
-              index === selected
-                ? selectedLine(theme, row, innerWidth)
-                : panelLine(row, innerWidth),
-            );
-          }
-        }
-
-        const emptyRows = Math.max(
-          0,
-          settings.listRows -
-            Math.max(1, Math.min(results.length, settings.listRows)),
-        );
-        for (let i = 0; i < emptyRows; i += 1)
-          lines.push(panelLine("", innerWidth));
-
-        lines.push(panelLine("", innerWidth));
-        const footerParts = [
-          `${theme.fg("warning", "-/=")} ${theme.fg("dim", "page")}`,
-        ];
-        const deleteHint = shortcutHint(settings.deleteShortcuts);
-        if (deleteHint)
-          footerParts.push(
-            `${theme.fg("warning", deleteHint)} ${theme.fg("dim", "delete")}`,
-          );
-        const deleteAllHint = shortcutHint(settings.deleteAllShortcuts);
-        if (deleteAllHint)
-          footerParts.push(
-            `${theme.fg("warning", deleteAllHint)} ${theme.fg("dim", "delete all")}`,
-          );
-        const status = confirmDeleteAll
-          ? theme.fg("warning", "delete all stashed prompts?")
-          : footerParts.join(theme.fg("dim", " · "));
-        lines.push(panelLine(status, innerWidth));
-
-        const frame = framePopup(
-          lines,
-          panelWidth,
-          theme,
-          "Prompt Stash",
-          `${items.length} saved`,
-        );
-        const left = " ".repeat(
-          Math.max(0, Math.floor((width - panelWidth) / 2)),
-        );
-        return frame.map((line) =>
-          truncateToWidth(`${left}${line}`, width, ""),
-        );
-      };
-
-      let nativeMemo:
-        | {
-            items: readonly StashItem[];
-            query: string;
-            selectedId: string | null;
-            confirmDeleteAll: boolean;
-            node: PickerNode;
-          }
-        | undefined;
-
-      const describe = (cx: DescribeContext): NativeNode | null => {
-        if (!cx.supports("picker")) return null;
-        clampSelection();
-        const results = filtered();
-        const selectedId = results[selected]?.id ?? null;
-        if (
-          nativeMemo &&
-          nativeMemo.items === items &&
-          nativeMemo.query === query &&
-          nativeMemo.selectedId === selectedId &&
-          nativeMemo.confirmDeleteAll === confirmDeleteAll
-        )
-          return nativeMemo.node;
-        const node = stashPicker(
-          items,
-          results,
-          selectedId,
-          query,
-          confirmDeleteAll,
-          settings,
-        );
-        nativeMemo = { items, query, selectedId, confirmDeleteAll, node };
-        return node;
+      const restoreSelected = (): void => {
+        const item = results()[selected()];
+        if (item) done(item.text);
       };
 
       const selectById = (id: string): boolean => {
-        const index = filtered().findIndex((item) => item.id === id);
+        const index = results().findIndex((item) => item.id === id);
         if (index < 0) return false;
-        selected = index;
-        clampSelection();
+        selected.set(index);
         return true;
       };
 
-      const handleNativeEvent = (event: NativeUiEvent): void => {
-        if (event.key.replaceAll("^", "") !== "") return;
-        if (event.type === "select") {
-          selectById(event.item);
-          return;
+      const handleKey = (key: KeyEvent): boolean => {
+        if (key.kind === "release") return false;
+
+        if (confirmDeleteAll()) {
+          if (matchesKey(key, "enter")) {
+            clearAll();
+            return true;
+          }
+          if (matchesKey(key, "escape") || matchesKey(key, "ctrl+c")) {
+            confirmDeleteAll.set(false);
+            return true;
+          }
         }
-        if (event.type === "activate") {
-          if (selectById(event.item)) restoreSelected();
-          return;
+
+        if (matchesKey(key, "escape") || matchesKey(key, "ctrl+c")) {
+          done(null);
+          return true;
         }
-        if (event.type !== "action") return;
-        switch (event.act) {
+        if (matchesKey(key, "enter")) {
+          restoreSelected();
+          return true;
+        }
+        if (matchesKey(key, "up")) {
+          moveSelection(-1);
+          return true;
+        }
+        if (matchesKey(key, "down")) {
+          moveSelection(1);
+          return true;
+        }
+        if (matchesKey(key, "-") || matchesKey(key, "pageUp")) {
+          moveSelection(-settings.listRows);
+          return true;
+        }
+        if (matchesKey(key, "=") || matchesKey(key, "pageDown")) {
+          moveSelection(settings.listRows);
+          return true;
+        }
+        if (matchesAnyShortcut(key, settings.deleteShortcuts)) {
+          deleteSelected();
+          return true;
+        }
+        if (matchesAnyShortcut(key, settings.deleteAllShortcuts)) {
+          confirmDeleteAll.set(items().length > 0);
+          return true;
+        }
+        if (matchesKey(key, "ctrl+u")) {
+          query.set("");
+          selected.set(0);
+          return true;
+        }
+        if (matchesKey(key, "backspace")) {
+          query.set(query().slice(0, -1));
+          selected.set(0);
+          return true;
+        }
+        if (key.text) {
+          query.set(query() + key.text);
+          selected.set(0);
+          return true;
+        }
+        return false;
+      };
+
+      const handlePaste = (paste: PasteEvent): boolean => {
+        query.set(query() + paste.text);
+        selected.set(0);
+        return true;
+      };
+
+      const handleAction = (act: string): void => {
+        switch (act) {
           case "restore":
             restoreSelected();
             return;
@@ -877,12 +641,12 @@ async function openStashPopup(ctx: ExtensionContext): Promise<void> {
             deleteSelected();
             return;
           case "deleteAll":
-            if (confirmDeleteAll) clearAll();
-            else confirmDeleteAll = items.length > 0;
+            if (confirmDeleteAll()) clearAll();
+            else confirmDeleteAll.set(items().length > 0);
             return;
           case "cancel":
-            if (confirmDeleteAll) {
-              confirmDeleteAll = false;
+            if (confirmDeleteAll()) {
+              confirmDeleteAll.set(false);
               return;
             }
             done(null);
@@ -893,107 +657,46 @@ async function openStashPopup(ctx: ExtensionContext): Promise<void> {
         }
       };
 
-      return {
-        get focused(): boolean {
-          return focused;
+      const props = {
+        title: "Prompt Stash",
+        noun: "prompts",
+        size: settings.popupWidth > DEFAULT_POPUP_WIDTH ? "lg" : "md",
+        layout: "rows",
+        preview: "none",
+        query,
+        placeholder: "Search stashed prompts…",
+        columns: [{ id: "lines", format: "dim" }],
+        items: rows,
+        selected: selectedId,
+        total: () => items().length,
+        empty: () =>
+          results().length === 0
+            ? items().length === 0
+              ? "Prompt stash is empty"
+              : "No matching stashed prompts"
+            : undefined,
+        actions,
+        confirm: () =>
+          confirmDeleteAll()
+            ? {
+                text: "Delete all stashed prompts?",
+                act: "deleteAll",
+                label: "Delete all",
+              }
+            : null,
+        term: { maxRows: settings.listRows, wrap: false },
+        onKey: handleKey,
+        onPaste: handlePaste,
+        onSelect: (id: string) => {
+          selectById(id);
         },
-        set focused(value: boolean) {
-          focused = value;
+        onActivate: (id: string) => {
+          if (selectById(id)) restoreSelected();
         },
-        handleInput(data: string) {
-          if (matchesAction(keybindings, data, "app.display.reset", "alt+l")) {
-            tui.resetDisplay();
-            tui.requestRender(true);
-            return;
-          }
-          if (matchesAction(keybindings, data, "app.suspend", "ctrl+z")) {
-            handleSuspend(tui);
-            return;
-          }
+        onAction: handleAction,
+      } satisfies PickerAttributes;
 
-          if (confirmDeleteAll) {
-            if (matchesKey(data, "return") || matchesKey(data, "enter")) {
-              clearAll();
-              return;
-            }
-            if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
-              confirmDeleteAll = false;
-              tui.requestRender();
-              return;
-            }
-          }
-
-          if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
-            done(null);
-            return;
-          }
-          if (matchesKey(data, "return") || matchesKey(data, "enter")) {
-            restoreSelected();
-            return;
-          }
-          if (matchesKey(data, "up")) {
-            selected -= 1;
-            clampSelection();
-            tui.requestRender();
-            return;
-          }
-          if (matchesKey(data, "down")) {
-            selected += 1;
-            clampSelection();
-            tui.requestRender();
-            return;
-          }
-          if (matchesKey(data, "-") || matchesKey(data, "pageUp")) {
-            selected -= settings.listRows;
-            clampSelection();
-            tui.requestRender();
-            return;
-          }
-          if (matchesKey(data, "=") || matchesKey(data, "pageDown")) {
-            selected += settings.listRows;
-            clampSelection();
-            tui.requestRender();
-            return;
-          }
-          if (matchesAnyShortcut(data, settings.deleteShortcuts)) {
-            deleteSelected();
-            return;
-          }
-          if (matchesAnyShortcut(data, settings.deleteAllShortcuts)) {
-            confirmDeleteAll = items.length > 0;
-            tui.requestRender();
-            return;
-          }
-          if (matchesKey(data, "ctrl+u")) {
-            query = "";
-            selected = 0;
-            clampSelection();
-            tui.requestRender();
-            return;
-          }
-          if (matchesKey(data, "backspace")) {
-            query = query.slice(0, -1);
-            selected = 0;
-            clampSelection();
-            tui.requestRender();
-            return;
-          }
-          const printableText = extractPrintableText(data);
-          if (printableText) {
-            query += printableText;
-            selected = 0;
-            clampSelection();
-            tui.requestRender();
-          }
-        },
-        invalidate() {
-          nativeMemo = undefined;
-        },
-        render,
-        nativeSheet: (cx: DescribeContext) => cx.supports("picker"),
-        describe,
-        handleNativeEvent,
-      };
+      return jsx("picker", props);
     },
     { overlay: true },
   );
@@ -1027,10 +730,15 @@ async function toggleStash(ctx: ExtensionContext): Promise<void> {
 export default function promptStash(pi: ExtensionAPI): void {
   const initialSettings = settingsFor(process.cwd());
   if (initialSettings.shortcut !== "none") {
-    pi.registerShortcut(initialSettings.shortcut as KeyId, {
-      description: "Stash current prompt or restore from prompt stash",
-      handler: async (ctx) => toggleStash(ctx),
-    });
+    pi.registerShortcut(
+      initialSettings.shortcut as Parameters<
+        ExtensionAPI["registerShortcut"]
+      >[0],
+      {
+        description: "Stash current prompt or restore from prompt stash",
+        handler: async (ctx) => toggleStash(ctx),
+      },
+    );
   }
 
   pi.registerCommand("prompt-stash", {

@@ -11,7 +11,8 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { getPluginsLockfile } from "@oh-my-pi/pi-utils";
-import { setKittyProtocolActive } from "@oh-my-pi/pi-tui";
+import { UiNode } from "@oh-my-pi/pi-tui";
+import type { KeyEvent, UiProps } from "@oh-my-pi/pi-tui";
 import promptStash from "../src/prompt-stash";
 
 type StoredItem = { id: string; text: string; createdAt: string };
@@ -24,22 +25,20 @@ type Notification = {
   message: string;
   type: "info" | "warning" | "error" | undefined;
 };
-type Component = {
-  handleInput?(data: string): void;
-  render(width: number): string[];
-};
+type Component = UiNode<"picker">;
 type Theme = {
   fg(name: string, text: string): string;
   bg(name: string, text: string): string;
   bold(text: string): string;
 };
-type Tui = {
-  requestRender(force?: boolean): void;
-  resetDisplay(): void;
-  stop(): void;
-  start(): void;
+type UiHost = {
+  requestRender(): void;
+  size(): { columns: number; rows: number };
+  suspend<R>(run: () => Promise<R>): Promise<R>;
 };
-type Keybindings = { matches(data: string, keybinding: string): boolean };
+type Keybindings = {
+  matches(event: KeyEvent, keybinding: string): boolean;
+};
 type Context = {
   cwd: string;
   hasUI: boolean;
@@ -77,35 +76,46 @@ const plainTheme: Theme = {
   bold: (text) => text,
 };
 
-const ENTER = "\r";
-const ESCAPE = "\x1b";
-const ARROW_DOWN = "\x1b[B";
-const DELETE = "\x1b[3~";
-const BACKSPACE = "\x7f";
-const CTRL_X = "\x18";
-const KITTY_DOWN = "\x1b[1;1B";
-const KITTY_ENTER = "\x1b[13u";
-const KITTY_B = "\x1b[98u";
-const MODIFY_OTHER_KEYS_SHIFT_E = "\x1b[27;2;69~";
-const MODIFY_OTHER_KEYS_CTRL_R = "\x1b[27;5;114~";
+const ENTER = "enter";
+const ESCAPE = "escape";
+const ARROW_DOWN = "down";
+const DELETE = "delete";
+const BACKSPACE = "backspace";
+const CTRL_X = "ctrl+x";
+const KITTY_DOWN = "down";
+const KITTY_ENTER = "enter";
+const KITTY_B = "b";
+const MODIFY_OTHER_KEYS_SHIFT_E = "shift+e";
+const MODIFY_OTHER_KEYS_CTRL_R = "ctrl+r";
+
+function inputEvent(id: string): KeyEvent {
+  const text =
+    id === "space"
+      ? " "
+      : /^shift\+[a-z]$/.test(id)
+        ? id.at(-1)?.toUpperCase()
+        : id.length === 1
+          ? id
+          : undefined;
+  return { id, text, kind: "press", raw: id };
+}
 
 class FakeUi {
   editor: string;
   readonly notifications: Notification[] = [];
   readonly overlays: boolean[] = [];
-  readonly renders: string[][] = [];
+  readonly renders: Readonly<UiProps<"picker">>[] = [];
   private readonly inputs: string[];
   private active: Component | undefined;
-  private readonly tui: Tui;
+  private readonly host: UiHost;
 
   constructor(editor = "", inputs: string[] = []) {
     this.editor = editor;
     this.inputs = inputs;
-    this.tui = {
+    this.host = {
       requestRender: () => this.captureRender(),
-      resetDisplay: () => this.captureRender(),
-      stop: () => {},
-      start: () => {},
+      size: () => ({ columns: 120, rows: 40 }),
+      suspend: <R>(run: () => Promise<R>) => run(),
     };
   }
 
@@ -123,34 +133,36 @@ class FakeUi {
 
   custom<T>(
     factory: (
-      tui: Tui,
+      ui: UiHost,
       theme: Theme,
       keybindings: Keybindings,
       done: (result: T) => void,
     ) => Component,
     options?: { overlay?: boolean },
   ): Promise<T> {
-    let resolveResult: (result: T) => void = () => {};
-    const result = new Promise<T>((resolve) => {
-      resolveResult = resolve;
-    });
+    let settled = false;
+    const { promise, resolve } = Promise.withResolvers<T>();
     this.overlays.push(options?.overlay === true);
     this.active = factory(
-      this.tui,
+      this.host,
       plainTheme,
-      { matches: (data, key) => data === key },
-      resolveResult,
+      { matches: () => false },
+      (value) => {
+        settled = true;
+        resolve(value);
+      },
     );
     this.captureRender();
     for (const input of this.inputs) {
-      this.active.handleInput?.(input);
+      if (settled) break;
+      this.active.handlers.onKey?.(inputEvent(input));
       this.captureRender();
     }
-    return result;
+    return promise;
   }
 
   private captureRender(): void {
-    if (this.active) this.renders.push(this.active.render(120));
+    if (this.active) this.renders.push(this.active.props());
   }
 }
 
@@ -270,7 +282,6 @@ function command(api: FakeApi): Command {
 }
 
 beforeEach(() => {
-  setKittyProtocolActive(false);
   Object.assign(environmentBeforeTest, process.env);
   cwdBeforeTest = process.cwd();
   const root = mkdtempSync(join(tmpdir(), "omp-prompt-stash-test-"));
@@ -287,7 +298,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  setKittyProtocolActive(false);
   if (process.cwd() !== cwdBeforeTest) process.chdir(cwdBeforeTest);
   restoreEnvironment();
   rmSync(fixture.root, { recursive: true, force: true });
@@ -545,24 +555,21 @@ describe("prompt stash extension factory", () => {
 
     expect(
       picker.ui.renders.some((render) =>
-        render.join("\n").includes("second prompt"),
+        render.items?.some((entry) => entry.label === "second prompt"),
       ),
     ).toBeTrue();
     expect(
-      picker.ui.renders.some((render) =>
-        render.join("\n").includes("Prompt Stash"),
-      ),
+      picker.ui.renders.some((render) => render.title === "Prompt Stash"),
     ).toBeTrue();
     expect(
       picker.ui.renders.some((render) =>
-        render.join("\n").includes("first prompt"),
+        render.items?.some((entry) => entry.label === "first prompt"),
       ),
     ).toBeTrue();
     expect(picker.ui.editor).toBe("first prompt");
   });
 
-  test("navigates and restores with Kitty CSI-u input", async () => {
-    setKittyProtocolActive(true);
+  test("navigates and restores from decoded key events", async () => {
     writeStore(storePath("kitty-navigation"), [
       item("new", "newest", "2025-01-02T00:00:00.000Z"),
       item("old", "oldest", "2025-01-01T00:00:00.000Z"),
@@ -577,7 +584,7 @@ describe("prompt stash extension factory", () => {
     expect(picker.ui.editor).toBe("oldest");
   });
 
-  test("uses modifyOtherKeys input for configured deletion shortcuts", async () => {
+  test("uses configured deletion shortcuts from canonical key events", async () => {
     settings({ deleteShortcuts: "ctrl+r" });
     writeStore(storePath("modified-delete"), [
       item("new", "newest", "2025-01-02T00:00:00.000Z"),
@@ -632,8 +639,8 @@ describe("prompt stash extension factory", () => {
     const cancel = context("delete", "unchanged", [CTRL_X, ESCAPE, ESCAPE]);
     await command(api).handler([], cancel);
     expect(
-      cancel.ui.renders.some((render) =>
-        render.join("\n").includes("delete all stashed prompts?"),
+      cancel.ui.renders.some(
+        (render) => render.confirm?.text === "Delete all stashed prompts?",
       ),
     ).toBeTrue();
     expect(readStore(storePath("delete"))).toHaveLength(2);
