@@ -5,6 +5,7 @@
 ## Requirements
 
 - [Oh My Pi](https://github.com/can1357/oh-my-pi) 19.2.1 or later
+- Bun 1.4.4 or later for source installs and development (the minimum required by the OMP 19.2.1 SDK).
 
 ## Install
 
