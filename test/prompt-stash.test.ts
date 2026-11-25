@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { getPluginsLockfile } from "@oh-my-pi/pi-utils";
+import { getPluginsLockfile } from "@oh-my-pi/pi-utils/dirs";
 import { UiNode } from "@oh-my-pi/pi-tui";
 import type { KeyEvent, UiProps } from "@oh-my-pi/pi-tui";
 import promptStash from "../src/prompt-stash";

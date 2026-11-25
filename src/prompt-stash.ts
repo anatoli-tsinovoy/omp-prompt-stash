@@ -8,7 +8,7 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { getAgentDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
+import { getAgentDir, getPluginsLockfile } from "@oh-my-pi/pi-utils/dirs";
 import { computed, jsx, signal } from "@oh-my-pi/pi-tui";
 import type {
   KeyEvent,
