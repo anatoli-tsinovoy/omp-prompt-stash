@@ -1,6 +1,6 @@
 {
   "name": "omp-prompt-stash",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Persistent prompt stash extension for Oh My Pi",
   "type": "module",
   "author": "anatoli-tsinovoy",
